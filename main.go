@@ -39,7 +39,7 @@ func (g *GPUSlice) Set(value string) error {
 }
 
 func (s SpeculativeConfig) String() string {
-	return fmt.Sprintf("{\"model\": %q, \"method\": %q, \"num_speculative_tokens\": %d \"speculative_token_tree\": %q}", s.Model, s.Method, s.NumSpeculativeTokens, s.SpeculativeTokenTree)
+	return fmt.Sprintf("--speculative-config={\"model\": %q, \"method\": %q, \"num_speculative_tokens\": %d, \"speculative_token_tree\": %q}", s.Model, s.Method, s.NumSpeculativeTokens, s.SpeculativeTokenTree)
 }
 
 func main() {
@@ -167,6 +167,7 @@ func run(enableCudagraph bool, width, depth int, env []string, port int) error {
 		serveCmd.Stdout = &serveBuf
 		serveCmd.Stderr = &serveBuf
 		serveCmd.WaitDelay = 10 * time.Second
+		log.Println("starting server cmd")
 		if err := serveCmd.Run(); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return nil
@@ -186,6 +187,7 @@ func run(enableCudagraph bool, width, depth int, env []string, port int) error {
 		benchCmd.Stdout = &benchBuf
 		benchCmd.Stderr = &benchBuf
 
+		log.Println("starting bench cmd")
 		if err := benchCmd.Run(); err != nil {
 			return fmt.Errorf("failed to run bench command: %w", err)
 		}
@@ -245,9 +247,10 @@ func run(enableCudagraph bool, width, depth int, env []string, port int) error {
 
 func makeTreeString(width int, depth int) string {
 	temp := []string{}
-	for i := 1; i < depth; i++ {
-		for j := 1; j < width; j++ {
-			temp = append(temp, fmt.Sprintf("(%v", width)+strings.Repeat(", 0", depth-1)+")")
+	zeros := strings.Split(strings.Repeat("0", width), "")
+	for i := 0; i < depth; i++ {
+		for j := 0; j < width; j++ {
+			temp = append(temp, fmt.Sprintf("(%v,", i)+strings.Join(zeros[:j], ",") +")")
 		}
 	}
 	out := strings.Join(temp, ",")
