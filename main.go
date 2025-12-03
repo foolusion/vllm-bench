@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -76,6 +76,7 @@ func fullRun(gpus []string, environ []string) error {
 	var errs []error
 	for err := range done {
 		if err != nil {
+			log.Println(err)
 			errs = append(errs, err)
 		}
 	}
@@ -87,16 +88,18 @@ func startWorkers(ch <-chan work, gpus []string, environ []string) <-chan error 
 	var wg errgroup.Group
 	port := 9000
 	for _, gpu := range gpus {
-		port := port
-		wg.Go(func() error {
-			gpu := "CUDA_VISIBLE_DEVICES=" + gpu
-			for w := range ch {
-				if err := run(w.enableCudagraph, w.width, w.depth, append(environ, gpu), port); err != nil {
-					c <- fmt.Errorf("failed to run(%v, %v, %v): %v", w.enableCudagraph, w.width, w.depth, err)
+		wg.Go(func(port int) func() error {
+			return func() error {
+				gpu := "CUDA_VISIBLE_DEVICES=" + gpu
+				for w := range ch {
+					log.Printf("worker %v: enableCudagraph=%v, width=%v, depth=%v", port, w.enableCudagraph, w.width, w.depth)
+					if err := run(w.enableCudagraph, w.width, w.depth, append(environ, gpu), port); err != nil {
+						c <- fmt.Errorf("failed to run(%v, %v, %v): %v", w.enableCudagraph, w.width, w.depth, err)
+					}
 				}
+				return nil
 			}
-			return nil
-		})
+		}(port))
 		port++
 	}
 	go func() {
@@ -155,38 +158,28 @@ func run(enableCudagraph bool, width, depth int, env []string, port int) error {
 	benchArgs := strings.Split("vllm bench serve --model=meta-llama/Llama-3.1-8B-Instruct --tokenizer=meta-llama/Llama-3.1-8B-Instruct --dataset-name=hf --dataset-path=philschmid/mt-bench --ignore-eos --request-rate=inf --max-concurrency=1 --num-prompts=80", " ")
 	benchArgs = append(benchArgs, fmt.Sprintf("--port=%d", port))
 
-	serveBuf := bytes.Buffer{}
-	serveCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	var wg errgroup.Group
 
+	serveBuf := bytes.Buffer{}
+	serveCmd := exec.Command(serveArgs[0], serveArgs[1:]...)
+	serveCmd.Env = myenv
+	serveCmd.Stdout = &serveBuf
+	serveCmd.Stderr = &serveBuf
+	serveCmd.WaitDelay = 10 * time.Second
 	wg.Go(func() error {
-		serveCmd := exec.CommandContext(serveCtx, serveArgs[0], serveArgs[1:]...)
-		serveCmd.Env = myenv
-		serveCmd.Stdout = &serveBuf
-		serveCmd.Stderr = &serveBuf
-		serveCmd.WaitDelay = 10 * time.Second
 		log.Println("starting server cmd")
-		if err := serveCmd.Run(); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil
-			} else if errors.Is(err, os.ErrProcessDone) {
-				return nil
-			}
-			return fmt.Errorf("serve error: %w", err)
-		}
-		return nil
+		return serveCmd.Run()
 	})
 
 	benchBuf := bytes.Buffer{}
+	benchCmd := exec.Command(benchArgs[0], benchArgs[1:]...)
+	benchCmd.Env = myenv
+	benchCmd.Stdout = &benchBuf
+	benchCmd.Stderr = &benchBuf
 	wg.Go(func() error {
-		defer cancel()
-		benchCmd := exec.Command(benchArgs[0], benchArgs[1:]...)
-		benchCmd.Env = myenv
-		benchCmd.Stdout = &benchBuf
-		benchCmd.Stderr = &benchBuf
-
+		defer func() {
+			serveCmd.Process.Signal(syscall.SIGTERM)
+		}()
 		log.Println("starting bench cmd")
 		if err := benchCmd.Run(); err != nil {
 			return fmt.Errorf("failed to run bench command: %w", err)
@@ -207,50 +200,59 @@ func run(enableCudagraph bool, width, depth int, env []string, port int) error {
 		return err
 	}
 	w := bufio.NewWriter(f)
-
-	scanner := bufio.NewScanner(&benchBuf)
-	shouldWrite := false
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "Serving Benchmark Result") {
-			shouldWrite = true
-		}
-		if shouldWrite {
-			if _, err := fmt.Fprintln(w, line); err != nil {
-				log.Printf("failed to write bench result: %v", err)
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("failed to scan bench result: %v", err)
-	}
+	w.ReadFrom(&benchBuf)
 	if err := w.Flush(); err != nil {
 		log.Printf("failed to flush bench result: %v", err)
 	}
-	scanner = bufio.NewScanner(&serveBuf)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, "Avg prompt throughput") || strings.Contains(line, "SpecDecoding metrics") {
-			if _, err := fmt.Fprintln(w, line); err != nil {
-				log.Printf("failed to write serve result: %v", err)
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("failed to scan serve result: %v", err)
-	}
+	w.ReadFrom(&serveBuf)
 	if err := w.Flush(); err != nil {
 		log.Printf("failed to flush serve result: %v", err)
 	}
+
+	// scanner := bufio.NewScanner(&benchBuf)
+	// shouldWrite := false
+	// for scanner.Scan() {
+	// 	line := scanner.Text()
+	// 	if strings.Contains(line, "Serving Benchmark Result") {
+	// 		shouldWrite = true
+	// 	}
+	// 	if shouldWrite {
+	// 		if _, err := fmt.Fprintln(w, line); err != nil {
+	// 			log.Printf("failed to write bench result: %v", err)
+	// 		}
+	// 	}
+	// }
+	// if err := scanner.Err(); err != nil {
+	// 	log.Printf("failed to scan bench result: %v", err)
+	// }
+	// if err := w.Flush(); err != nil {
+	// 	log.Printf("failed to flush bench result: %v", err)
+	// }
+
+	// scanner = bufio.NewScanner(&serveBuf)
+	// for scanner.Scan() {
+	// 	line := scanner.Text()
+	// 	if strings.Contains(line, "Avg prompt throughput") || strings.Contains(line, "SpecDecoding metrics") {
+	// 		if _, err := fmt.Fprintln(w, line); err != nil {
+	// 			log.Printf("failed to write serve result: %v", err)
+	// 		}
+	// 	}
+	// }
+	// if err := scanner.Err(); err != nil {
+	// 	log.Printf("failed to scan serve result: %v", err)
+	// }
+	// if err := w.Flush(); err != nil {
+	// 	log.Printf("failed to flush serve result: %v", err)
+	// }
 	return f.Close()
 }
 
 func makeTreeString(width int, depth int) string {
 	temp := []string{}
-	zeros := strings.Split(strings.Repeat("0", width), "")
+	zeros := strings.Split(strings.Repeat("0", depth), "")
 	for i := 0; i < depth; i++ {
 		for j := 0; j < width; j++ {
-			temp = append(temp, fmt.Sprintf("(%v,", i)+strings.Join(zeros[:j], ",") +")")
+			temp = append(temp, fmt.Sprintf("(%v,", j)+strings.Join(zeros[:i], ",")+")")
 		}
 	}
 	out := strings.Join(temp, ",")
