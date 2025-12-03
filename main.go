@@ -85,16 +85,19 @@ func fullRun(gpus []string, environ []string) error {
 func startWorkers(ch <-chan work, gpus []string, environ []string) <-chan error {
 	c := make(chan error, 1)
 	var wg errgroup.Group
+	port := 9000
 	for _, gpu := range gpus {
+		port := port
 		wg.Go(func() error {
 			gpu := "CUDA_VISIBLE_DEVICES=" + gpu
 			for w := range ch {
-				if err := run(w.enableCudagraph, w.width, w.depth, append(environ, gpu)); err != nil {
+				if err := run(w.enableCudagraph, w.width, w.depth, append(environ, gpu), port); err != nil {
 					c <- fmt.Errorf("failed to run(%v, %v, %v): %v", w.enableCudagraph, w.width, w.depth, err)
 				}
 			}
 			return nil
 		})
+		port++
 	}
 	go func() {
 		if err := wg.Wait(); err != nil {
@@ -129,7 +132,7 @@ func generateWork() <-chan work {
 	return out
 }
 
-func run(enableCudagraph bool, width, depth int, env []string) error {
+func run(enableCudagraph bool, width, depth int, env []string, port int) error {
 	myenv := make([]string, len(env))
 	copy(myenv, env)
 	myenv = append(myenv, "VLLM_USE_V1=1")
@@ -139,6 +142,7 @@ func run(enableCudagraph bool, width, depth int, env []string) error {
 		myenv = append(myenv, "CUDA_LAUNCH_BLOCKING=1")
 		serveArgs = append(serveArgs, "--enforce-eager")
 	}
+	serveArgs = append(serveArgs, fmt.Sprintf("--port=%d", port))
 	tree := makeTreeString(width, depth)
 	specConfig := SpeculativeConfig{
 		Model:                "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
@@ -149,6 +153,7 @@ func run(enableCudagraph bool, width, depth int, env []string) error {
 	serveArgs = append(serveArgs, specConfig.String())
 
 	benchArgs := strings.Split("vllm bench serve --model=meta-llama/Llama-3.1-8B-Instruct --tokenizer=meta-llama/Llama-3.1-8B-Instruct --dataset-name=hf --dataset-path=philschmid/mt-bench --ignore-eos --request-rate=inf --max-concurrency=1 --num-prompts=80", " ")
+	benchArgs = append(benchArgs, fmt.Sprintf("--port=%d", port))
 
 	serveBuf := bytes.Buffer{}
 	serveCtx, cancel := context.WithCancel(context.Background())
