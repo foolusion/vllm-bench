@@ -58,7 +58,7 @@ func main() {
 			log.Fatal(err)
 		}
 	} else {
-		if err := run(*enableCudagraph, *width, *depth, os.Environ()); err != nil {
+		if err := run(*enableCudagraph, *width, *depth, os.Environ(), 9000); err != nil {
 			log.Fatal(err)
 		}
 	}
