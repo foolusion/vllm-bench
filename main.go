@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +23,10 @@ type SpeculativeConfig struct {
 	Method               string
 	NumSpeculativeTokens int
 	SpeculativeTokenTree string
+}
+
+func (s SpeculativeConfig) String() string {
+	return fmt.Sprintf("--speculative-config={\"model\": %q, \"method\": %q, \"num_speculative_tokens\": %d, \"speculative_token_tree\": %q}", s.Model, s.Method, s.NumSpeculativeTokens, s.SpeculativeTokenTree)
 }
 
 type GPUSlice []string
@@ -38,10 +44,6 @@ func (g *GPUSlice) Set(value string) error {
 	return nil
 }
 
-func (s SpeculativeConfig) String() string {
-	return fmt.Sprintf("--speculative-config={\"model\": %q, \"method\": %q, \"num_speculative_tokens\": %d, \"speculative_token_tree\": %q}", s.Model, s.Method, s.NumSpeculativeTokens, s.SpeculativeTokenTree)
-}
-
 func main() {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
 	full := fs.Bool("full", false, "run bench on all valid tree combinations")
@@ -53,14 +55,23 @@ func main() {
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		log.Fatal(err)
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	if *full {
-		if err := fullRun(gpus, os.Environ()); err != nil {
+		if err := fullRun(ctx, gpus, os.Environ()); err != nil {
 			log.Fatal(err)
 		}
 	} else {
-		if err := run(*enableCudagraph, *width, *depth, os.Environ(), 9000); err != nil {
+		if err := run(ctx, *enableCudagraph, *width, *depth, os.Environ(), 9000); err != nil {
 			log.Fatal(err)
 		}
+	}
+	select {
+	case <-ctx.Done():
+		stop()
+	default:
 	}
 }
 
@@ -70,9 +81,9 @@ type work struct {
 	depth           int
 }
 
-func fullRun(gpus []string, environ []string) error {
-	ch := generateWork()
-	done := startWorkers(ch, gpus, environ)
+func fullRun(ctx context.Context, gpus []string, environ []string) error {
+	ch := generateWork(ctx)
+	done := startWorkers(ctx, ch, gpus, environ)
 	var errs []error
 	for err := range done {
 		if err != nil {
@@ -83,7 +94,35 @@ func fullRun(gpus []string, environ []string) error {
 	return errors.Join(errs...)
 }
 
-func startWorkers(ch <-chan work, gpus []string, environ []string) <-chan error {
+func generateWork(ctx context.Context) <-chan work {
+	out := make(chan work, 1)
+	go func() {
+		defer close(out)
+		for cg := range 2 {
+			for d := 1; d <= 32; d++ {
+				maxWidth := 64 / d
+				if d*maxWidth >= 64 {
+					maxWidth--
+				}
+				for w := 2; w <= maxWidth; w++ {
+					enableCudagraph := cg == 0
+					select {
+					case <-ctx.Done():
+						return
+					case out <- work{
+						enableCudagraph: enableCudagraph,
+						width:           w,
+						depth:           d,
+					}:
+					}
+				}
+			}
+		}
+	}()
+	return out
+}
+
+func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []string) <-chan error {
 	c := make(chan error, 1)
 	var wg errgroup.Group
 	port := 9000
@@ -93,7 +132,7 @@ func startWorkers(ch <-chan work, gpus []string, environ []string) <-chan error 
 				gpu := "CUDA_VISIBLE_DEVICES=" + gpu
 				for w := range ch {
 					log.Printf("worker %v: enableCudagraph=%v, width=%v, depth=%v", port, w.enableCudagraph, w.width, w.depth)
-					if err := run(w.enableCudagraph, w.width, w.depth, append(environ, gpu), port); err != nil {
+					if err := run(ctx, w.enableCudagraph, w.width, w.depth, append(environ, gpu), port); err != nil {
 						c <- fmt.Errorf("failed to run(%v, %v, %v): %v", w.enableCudagraph, w.width, w.depth, err)
 					}
 				}
@@ -111,31 +150,7 @@ func startWorkers(ch <-chan work, gpus []string, environ []string) <-chan error 
 	return c
 }
 
-func generateWork() <-chan work {
-	out := make(chan work, 1)
-	go func() {
-		for cg := range 2 {
-			for d := 1; d <= 32; d++ {
-				maxWidth := 64 / d
-				if d*maxWidth >= 64 {
-					maxWidth--
-				}
-				for w := 2; w <= maxWidth; w++ {
-					enableCudagraph := cg == 0
-					out <- work{
-						enableCudagraph: enableCudagraph,
-						width:           w,
-						depth:           d,
-					}
-				}
-			}
-		}
-		close(out)
-	}()
-	return out
-}
-
-func run(enableCudagraph bool, width, depth int, env []string, port int) error {
+func run(ctx context.Context, enableCudagraph bool, width, depth int, env []string, port int) error {
 	myenv := make([]string, len(env))
 	copy(myenv, env)
 	myenv = append(myenv, "VLLM_USE_V1=1")
@@ -158,36 +173,62 @@ func run(enableCudagraph bool, width, depth int, env []string, port int) error {
 	benchArgs := strings.Split("vllm bench serve --model=meta-llama/Llama-3.1-8B-Instruct --tokenizer=meta-llama/Llama-3.1-8B-Instruct --dataset-name=hf --dataset-path=philschmid/mt-bench --ignore-eos --request-rate=inf --max-concurrency=1 --num-prompts=80", " ")
 	benchArgs = append(benchArgs, fmt.Sprintf("--port=%d", port))
 
-	var wg errgroup.Group
-
 	serveBuf := bytes.Buffer{}
 	serveCmd := exec.Command(serveArgs[0], serveArgs[1:]...)
 	serveCmd.Env = myenv
 	serveCmd.Stdout = &serveBuf
 	serveCmd.Stderr = &serveBuf
 	serveCmd.WaitDelay = 10 * time.Second
-	wg.Go(func() error {
-		log.Println("starting server cmd")
-		return serveCmd.Run()
-	})
+	log.Println("starting serve cmd")
+	if err := serveCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start server command: %w", err)
+	}
 
 	benchBuf := bytes.Buffer{}
 	benchCmd := exec.Command(benchArgs[0], benchArgs[1:]...)
 	benchCmd.Env = myenv
 	benchCmd.Stdout = &benchBuf
 	benchCmd.Stderr = &benchBuf
-	wg.Go(func() error {
-		defer func() {
+	benchCmd.WaitDelay = 10 * time.Second
+	log.Println("starting bench cmd")
+	if err := benchCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start bench command: %w", err)
+	}
+
+	serveDone := make(chan error)
+	go func() {
+		serveDone <- serveCmd.Wait()
+		log.Println("serve done")
+		close(serveDone)
+	}()
+	benchDone := make(chan error)
+	go func() {
+		benchDone <- benchCmd.Wait()
+		log.Println("bench done")
+		close(benchDone)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("stopping workers")
+			benchCmd.Process.Signal(syscall.SIGTERM)
 			serveCmd.Process.Signal(syscall.SIGTERM)
-		}()
-		log.Println("starting bench cmd")
-		if err := benchCmd.Run(); err != nil {
-			return fmt.Errorf("failed to run bench command: %w", err)
+		case err := <-serveDone:
+			if err != nil {
+				log.Printf("serve failed: %v", err)
+			}
+			serveDone = nil
+		case err := <-benchDone:
+			if err != nil {
+				log.Printf("bench failed: %v", err)
+			}
+			benchDone = nil
+			serveCmd.Process.Signal(syscall.SIGTERM)
 		}
-		return nil
-	})
-	if err := wg.Wait(); err != nil {
-		log.Println(err)
+		if serveDone == nil && benchDone == nil {
+			break
+		}
 	}
 
 	cudagraphLabel := "cudagraph"
@@ -200,55 +241,31 @@ func run(enableCudagraph bool, width, depth int, env []string, port int) error {
 		return err
 	}
 	w := bufio.NewWriter(f)
-	w.ReadFrom(&benchBuf)
-	if err := w.Flush(); err != nil {
+	_, err = w.ReadFrom(&benchBuf)
+	if err != nil {
+		log.Printf("failed to write bench result: %v", err)
+	}
+	_, err = w.WriteString("\n\n")
+	if err != nil {
+		log.Printf("failed to write string: %v", err)
+	}
+	err = w.Flush()
+	if err != nil {
 		log.Printf("failed to flush bench result: %v", err)
 	}
-	w.ReadFrom(&serveBuf)
-	if err := w.Flush(); err != nil {
+	_, err = w.ReadFrom(&serveBuf)
+	if err != nil {
+		log.Printf("failed to write serve result: %v", err)
+	}
+	err = w.Flush()
+	if err != nil {
 		log.Printf("failed to flush serve result: %v", err)
 	}
-
-	// scanner := bufio.NewScanner(&benchBuf)
-	// shouldWrite := false
-	// for scanner.Scan() {
-	// 	line := scanner.Text()
-	// 	if strings.Contains(line, "Serving Benchmark Result") {
-	// 		shouldWrite = true
-	// 	}
-	// 	if shouldWrite {
-	// 		if _, err := fmt.Fprintln(w, line); err != nil {
-	// 			log.Printf("failed to write bench result: %v", err)
-	// 		}
-	// 	}
-	// }
-	// if err := scanner.Err(); err != nil {
-	// 	log.Printf("failed to scan bench result: %v", err)
-	// }
-	// if err := w.Flush(); err != nil {
-	// 	log.Printf("failed to flush bench result: %v", err)
-	// }
-
-	// scanner = bufio.NewScanner(&serveBuf)
-	// for scanner.Scan() {
-	// 	line := scanner.Text()
-	// 	if strings.Contains(line, "Avg prompt throughput") || strings.Contains(line, "SpecDecoding metrics") {
-	// 		if _, err := fmt.Fprintln(w, line); err != nil {
-	// 			log.Printf("failed to write serve result: %v", err)
-	// 		}
-	// 	}
-	// }
-	// if err := scanner.Err(); err != nil {
-	// 	log.Printf("failed to scan serve result: %v", err)
-	// }
-	// if err := w.Flush(); err != nil {
-	// 	log.Printf("failed to flush serve result: %v", err)
-	// }
 	return f.Close()
 }
 
 func makeTreeString(width int, depth int) string {
-	temp := []string{}
+	var temp []string
 	zeros := strings.Split(strings.Repeat("0", depth), "")
 	for i := 0; i < depth; i++ {
 		for j := 0; j < width; j++ {
