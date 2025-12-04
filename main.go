@@ -197,13 +197,19 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 
 	serveDone := make(chan error)
 	go func() {
-		serveDone <- serveCmd.Wait()
+		err := serveCmd.Wait()
+		if err != nil {
+			log.Printf("serve failed: %v", err)
+		}
 		log.Println("serve done")
 		close(serveDone)
 	}()
 	benchDone := make(chan error)
 	go func() {
-		benchDone <- benchCmd.Wait()
+		err := benchCmd.Wait()
+		if err != nil {
+			log.Printf("bench failed: %v", err)
+		}
 		log.Println("bench done")
 		close(benchDone)
 	}()
