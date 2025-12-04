@@ -214,10 +214,14 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 		close(benchDone)
 	}()
 
+	doneCtx, doneCancel := context.WithCancel(ctx)
+	defer doneCancel()
 	done := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		close(done)
+		<-doneCtx.Done()
+		if done != nil {
+			close(done)
+		}
 	}()
 
 	for {
