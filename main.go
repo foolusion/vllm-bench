@@ -240,7 +240,9 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 			serveCmd.Process.Signal(syscall.SIGTERM)
 		}
 		if serveDone == nil && benchDone == nil {
-			close(done)
+			if done != nil {
+				close(done)
+			}
 			break
 		}
 	}
