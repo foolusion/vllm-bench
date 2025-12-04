@@ -214,12 +214,19 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 		close(benchDone)
 	}()
 
+	done := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		close(done)
+	}()
+
 	for {
 		select {
-		case <-ctx.Done():
+		case <-done:
 			log.Println("stopping workers")
 			benchCmd.Process.Signal(syscall.SIGTERM)
 			serveCmd.Process.Signal(syscall.SIGTERM)
+			done = nil
 		case err := <-serveDone:
 			if err != nil {
 				log.Printf("serve failed: %v", err)
@@ -233,6 +240,7 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 			serveCmd.Process.Signal(syscall.SIGTERM)
 		}
 		if serveDone == nil && benchDone == nil {
+			close(done)
 			break
 		}
 	}
