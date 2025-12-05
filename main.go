@@ -64,7 +64,8 @@ func main() {
 			log.Fatal(err)
 		}
 	} else {
-		if err := run(ctx, *enableCudagraph, *width, *depth, os.Environ(), 9000); err != nil {
+		gpus := fmt.Sprintf("CUDA_VISIBLE_DEVICES=%v", strings.Join(gpus, ","))
+		if err := run(ctx, *enableCudagraph, *width, *depth, append(os.Environ(), gpus), 9000); err != nil {
 			log.Fatal(err)
 		}
 	}
