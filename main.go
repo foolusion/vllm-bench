@@ -83,9 +83,9 @@ type work struct {
 
 func fullRun(ctx context.Context, gpus []string, environ []string) error {
 	ch := generateWork(ctx)
-	done := startWorkers(ctx, ch, gpus, environ)
+	errsCh := startWorkers(ctx, ch, gpus, environ)
 	var errs []error
-	for err := range done {
+	for err := range errsCh {
 		if err != nil {
 			log.Println(err)
 			errs = append(errs, err)
@@ -228,20 +228,29 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 		select {
 		case <-done:
 			log.Println("stopping workers")
-			benchCmd.Process.Signal(syscall.SIGTERM)
-			serveCmd.Process.Signal(syscall.SIGTERM)
-			done = nil
-		case err := <-serveDone:
+			err := benchCmd.Process.Signal(syscall.SIGTERM)
 			if err != nil {
-				log.Printf("serve failed: %v", err)
+				log.Printf("failed to send SIGTERM to benchCmd: %v", err)
 			}
-			serveDone = nil
+			err = serveCmd.Process.Signal(syscall.SIGTERM)
+			if err != nil {
+				log.Printf("failed to send SIGTERM to serveCmd: %v", err)
+			}
+			done = nil
 		case err := <-benchDone:
 			if err != nil {
 				log.Printf("bench failed: %v", err)
 			}
 			benchDone = nil
-			serveCmd.Process.Signal(syscall.SIGTERM)
+			err = serveCmd.Process.Signal(syscall.SIGTERM)
+			if err != nil {
+				log.Printf("failed to send SIGTERM to serveCmd: %v", err)
+			}
+		case err := <-serveDone:
+			if err != nil {
+				log.Printf("serve failed: %v", err)
+			}
+			serveDone = nil
 		}
 		if serveDone == nil && benchDone == nil {
 			break
@@ -255,7 +264,7 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 	outputPath := fmt.Sprintf("vllm_server.%dx%d.%s.log", width, depth, cudagraphLabel)
 	f, err := os.Create(outputPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create output file: %w", err)
 	}
 	w := bufio.NewWriter(f)
 	_, err = w.ReadFrom(&benchBuf)
@@ -264,7 +273,7 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 	}
 	_, err = w.WriteString("\n\n")
 	if err != nil {
-		log.Printf("failed to write string: %v", err)
+		log.Printf("failed to write newlines: %v", err)
 	}
 	err = w.Flush()
 	if err != nil {
@@ -278,7 +287,11 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 	if err != nil {
 		log.Printf("failed to flush serve result: %v", err)
 	}
-	return f.Close()
+	err = f.Close()
+	if err != nil {
+		return fmt.Errorf("failed to close file: %w", err)
+	}
+	return nil
 }
 
 func makeTreeString(width int, depth int) string {
