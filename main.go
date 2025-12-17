@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -44,14 +45,43 @@ func (g *GPUSlice) Set(value string) error {
 	return nil
 }
 
+type TreeRange []int
+
+func (i *TreeRange) String() string {
+	return fmt.Sprint(*i)
+}
+
+func (i *TreeRange) Set(value string) error {
+	if value == "" {
+		*i = append(*i, 3) // default to 3
+		return nil
+	} else if strings.ToLower(value) == "all" {
+		for j := 1; j <= 64; j++ {
+			*i = append(*i, j)
+		}
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		val, err := strconv.Atoi(part)
+		if err != nil {
+			return fmt.Errorf("could not parse int: %w", err)
+		}
+		*i = append(*i, val)
+	}
+	return nil
+}
+
 func main() {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
 	full := fs.Bool("full", false, "run bench on all valid tree combinations")
 	var gpus GPUSlice
-	fs.Var(&gpus, "gpus", "comma-separated list of GPU devices to use")
-	enableCudagraph := fs.Bool("cudagraph", true, "enable cudagraph")
-	width := fs.Int("width", 3, "tree width")
-	depth := fs.Int("depth", 3, "tree depth")
+	fs.Var(&gpus, "gpus", "comma-separated list of GPU devices")
+	var widths TreeRange
+	fs.Var(&widths, "width", "comma-separated list of tree widths")
+	var depths TreeRange
+	fs.Var(&depths, "depth", "comma-separated list of tree depths")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		log.Fatal(err)
 	}
@@ -60,15 +90,18 @@ func main() {
 	defer stop()
 
 	if *full {
-		if err := fullRun(ctx, gpus, os.Environ()); err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		gpus := fmt.Sprintf("CUDA_VISIBLE_DEVICES=%v", strings.Join(gpus, ","))
-		if err := run(ctx, *enableCudagraph, *width, *depth, append(os.Environ(), gpus), 9000); err != nil {
-			log.Fatal(err)
+		depths = depths[:0]
+		widths = widths[:0]
+		for i := 1; i <= 64; i++ {
+			depths = append(depths, i)
+			widths = append(widths, i)
 		}
 	}
+
+	if err := fullRun(ctx, gpus, widths, depths, os.Environ()); err != nil {
+		log.Fatal(err)
+	}
+
 	select {
 	case <-ctx.Done():
 		stop()
@@ -82,8 +115,8 @@ type work struct {
 	depth           int
 }
 
-func fullRun(ctx context.Context, gpus []string, environ []string) error {
-	ch := generateWork(ctx)
+func fullRun(ctx context.Context, gpus []string, widths, depths []int, environ []string) error {
+	ch := generateWork(ctx, widths, depths)
 	errsCh := startWorkers(ctx, ch, gpus, environ)
 	var errs []error
 	for err := range errsCh {
@@ -95,27 +128,26 @@ func fullRun(ctx context.Context, gpus []string, environ []string) error {
 	return errors.Join(errs...)
 }
 
-func generateWork(ctx context.Context) <-chan work {
+func generateWork(ctx context.Context, widths, depths []int) <-chan work {
 	out := make(chan work, 1)
 	go func() {
 		defer close(out)
-		for cg := range 2 {
-			for d := 1; d <= 32; d++ {
-				maxWidth := 64 / d
-				if d*maxWidth >= 64 {
-					maxWidth--
+		for _, d := range depths {
+			if d == 64 {
+				continue
+			}
+			for _, w := range widths {
+				if w == 1 || w*d >= 64 {
+					continue
 				}
-				for w := 2; w <= maxWidth; w++ {
-					enableCudagraph := cg == 0
-					select {
-					case <-ctx.Done():
-						return
-					case out <- work{
-						enableCudagraph: enableCudagraph,
-						width:           w,
-						depth:           d,
-					}:
-					}
+				select {
+				case <-ctx.Done():
+					return
+				case out <- work{
+					enableCudagraph: true,
+					width:           w,
+					depth:           d,
+				}:
 				}
 			}
 		}

@@ -1,4 +1,4 @@
-module awesomeProject
+module go.aponeill.com/vllm-bench
 
 go 1.25
 
