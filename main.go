@@ -82,6 +82,8 @@ func main() {
 	fs.Var(&widths, "width", "comma-separated list of tree widths")
 	var depths TreeRange
 	fs.Var(&depths, "depth", "comma-separated list of tree depths")
+	draftModel := fs.String("draft_model", "yuhuili/EAGLE-LLaMA3.1-Instruct-8B", "the model to use for drafting")
+	targetModel := fs.String("target_model", "meta-llama/Llama-3.1-8B-Instruct", "the model to use for verification")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		log.Fatal(err)
 	}
@@ -98,7 +100,7 @@ func main() {
 		}
 	}
 
-	if err := fullRun(ctx, gpus, widths, depths, os.Environ()); err != nil {
+	if err := fullRun(ctx, gpus, widths, depths, os.Environ(), *draftModel, *targetModel); err != nil {
 		log.Fatal(err)
 	}
 
@@ -115,9 +117,9 @@ type work struct {
 	depth           int
 }
 
-func fullRun(ctx context.Context, gpus []string, widths, depths []int, environ []string) error {
+func fullRun(ctx context.Context, gpus []string, widths, depths []int, environ []string, draftModel, targetModel string) error {
 	ch := generateWork(ctx, widths, depths)
-	errsCh := startWorkers(ctx, ch, gpus, environ)
+	errsCh := startWorkers(ctx, ch, gpus, environ, draftModel, targetModel)
 	var errs []error
 	for err := range errsCh {
 		if err != nil {
@@ -155,7 +157,7 @@ func generateWork(ctx context.Context, widths, depths []int) <-chan work {
 	return out
 }
 
-func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []string) <-chan error {
+func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []string, draftModel, targetModel string) <-chan error {
 	c := make(chan error, 1)
 	var wg errgroup.Group
 	port := 9000
@@ -165,7 +167,7 @@ func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []
 				gpu := "CUDA_VISIBLE_DEVICES=" + gpu
 				for w := range ch {
 					log.Printf("worker %v: enableCudagraph=%v, width=%v, depth=%v", port, w.enableCudagraph, w.width, w.depth)
-					if err := run(ctx, w.enableCudagraph, w.width, w.depth, append(environ, gpu), port); err != nil {
+					if err := run(ctx, w.enableCudagraph, w.width, w.depth, append(environ, gpu), port, draftModel, targetModel); err != nil {
 						c <- fmt.Errorf("failed to run(%v, %v, %v): %v", w.enableCudagraph, w.width, w.depth, err)
 					}
 				}
@@ -183,28 +185,49 @@ func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []
 	return c
 }
 
-func run(ctx context.Context, enableCudagraph bool, width, depth int, env []string, port int) error {
+func run(ctx context.Context, enableCudagraph bool, width, depth int, env []string, port int, draftModel, targetModel string) error {
 	myenv := make([]string, len(env))
 	copy(myenv, env)
 	myenv = append(myenv, "VLLM_USE_V1=1")
 
-	serveArgs := strings.Split("vllm serve meta-llama/Llama-3.1-8B-Instruct --disable-log-requests --tensor-parallel-size=1 --max-num-seqs=64 --max-model-len=32768 --no-enable-prefix-caching", " ")
+	serveArgs := []string{
+		"vllm",
+		"serve",
+		targetModel,
+		"--disable-log-requests",
+		"--tensor-parallel-size=1",
+		"--max-num-seqs=64",
+		"--max-model-len=32768",
+		"--no-enable-prefix-caching",
+		fmt.Sprintf("--port=%d", port),
+	}
 	if !enableCudagraph {
 		myenv = append(myenv, "CUDA_LAUNCH_BLOCKING=1")
 		serveArgs = append(serveArgs, "--enforce-eager")
 	}
-	serveArgs = append(serveArgs, fmt.Sprintf("--port=%d", port))
 	tree := makeTreeString(width, depth)
 	specConfig := SpeculativeConfig{
-		Model:                "yuhuili/EAGLE-LLaMA3.1-Instruct-8B",
+		Model:                draftModel,
 		Method:               "eagle",
 		NumSpeculativeTokens: width * depth,
 		SpeculativeTokenTree: tree,
 	}
 	serveArgs = append(serveArgs, specConfig.String())
 
-	benchArgs := strings.Split("vllm bench serve --model=meta-llama/Llama-3.1-8B-Instruct --tokenizer=meta-llama/Llama-3.1-8B-Instruct --dataset-name=hf --dataset-path=philschmid/mt-bench --ignore-eos --request-rate=inf --max-concurrency=1 --num-prompts=80", " ")
-	benchArgs = append(benchArgs, fmt.Sprintf("--port=%d", port))
+	benchArgs := []string{
+		"vllm",
+		"bench",
+		"serve",
+		"--model=" + targetModel,
+		"--tokenizer=" + targetModel,
+		"--dataset-name=hf",
+		"--dataset-path=philschmid/mt-bench",
+		"--ignore-eos",
+		"--request-rate=inf",
+		"--max-concurrency=1",
+		"--num-prompts=80",
+		fmt.Sprintf("--port=%d", port),
+	}
 
 	serveBuf := bytes.Buffer{}
 	serveCmd := exec.Command(serveArgs[0], serveArgs[1:]...)
