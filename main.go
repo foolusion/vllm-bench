@@ -362,3 +362,76 @@ func makeTreeString(width int, depth int) string {
 	out = "[" + out + "]"
 	return out
 }
+
+type worker interface {
+	Start(*WorkConfig)
+	Stop()
+}
+
+type WorkDAG struct {
+	worker  Worker
+	parents []string
+}
+
+func runDAG(ctx context.Context, workDAG map[string]*WorkDAG, config *WorkConfig) {
+	started := map[string]struct{}{}
+
+	runCtx, runCancel = context.WithCancel(ctx)
+	defer runCancel()
+
+}
+
+type ServeWorker struct {
+	cmd  []string
+	env  []string
+	done chan error
+}
+
+func (s *ServeWorker) Start(config *WorkConfig) {
+	myenv := make([]string, len(env))
+	copy(myenv, env)
+	myenv = append(myenv, "VLLM_USE_V1=1")
+
+	serveArgs := []string{
+		"vllm",
+		"serve",
+		targetModel,
+		"--disable-log-requests",
+		"--tensor-parallel-size=1",
+		"--max-num-seqs=64",
+		"--max-model-len=32768",
+		"--no-enable-prefix-caching",
+		fmt.Sprintf("--port=%d", port),
+	}
+	if !enableCudagraph {
+		myenv = append(myenv, "CUDA_LAUNCH_BLOCKING=1")
+		serveArgs = append(serveArgs, "--enforce-eager")
+	}
+	tree := makeTreeString(width, depth)
+	specConfig := SpeculativeConfig{
+		Model:                draftModel,
+		Method:               "eagle",
+		NumSpeculativeTokens: width * depth,
+		SpeculativeTokenTree: tree,
+	}
+	serveArgs = append(serveArgs, specConfig.String())
+	serveBuf := bytes.Buffer{}
+	serveCmd := exec.Command(serveArgs[0], serveArgs[1:]...)
+	serveCmd.Env = myenv
+	serveCmd.Stdout = &serveBuf
+	serveCmd.Stderr = &serveBuf
+	serveCmd.WaitDelay = 10 * time.Second
+	log.Println("starting serve cmd")
+	if err := serveCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start server command: %w", err)
+	}
+	s.done := make(chan error)
+	go func() {
+		err := serveCmd.Wait()
+		if err != nil {
+			log.Printf("serve failed: %v", err)
+		}
+		log.Println("serve done")
+		close(s.done)
+	}()
+}
