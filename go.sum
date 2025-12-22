@@ -1,2 +1,4 @@
-golang.org/x/sync v0.18.0 h1:kr88TuHDroi+UVf+0hZnirlk8o8T+4MrK6mr60WkH/I=
-golang.org/x/sync v0.18.0/go.mod h1:9KTHXmSnoGruLpwFjVSX0lNNA75CykiMECbovNTZqGI=
+go.aponeill.com/dag v0.0.0-20251226062756-96088bf8240b h1:S77RY+y5LZptsxuKbeKftprrFVBiczrS6t1Rv4+5zPI=
+go.aponeill.com/dag v0.0.0-20251226062756-96088bf8240b/go.mod h1:CDU0tpAWY7iKXGMbdQVzbNaaOxgu1K8WOebmvLzYfpo=
+golang.org/x/sync v0.19.0 h1:vV+1eWNmZ5geRlYjzm2adRgW2/mcpevXNg50YZtPCE4=
+golang.org/x/sync v0.19.0/go.mod h1:9KTHXmSnoGruLpwFjVSX0lNNA75CykiMECbovNTZqGI=
