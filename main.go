@@ -7,7 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -75,6 +75,12 @@ func (i *TreeRange) Set(value string) error {
 }
 
 func main() {
+	handlerOpts := &slog.HandlerOptions{
+		Level:     slog.LevelInfo,
+		AddSource: true,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, handlerOpts))
+	slog.SetDefault(logger)
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
 	full := fs.Bool("full", false, "run bench on all valid tree combinations")
 	var gpus GPUSlice
@@ -82,11 +88,12 @@ func main() {
 	var widths TreeRange
 	fs.Var(&widths, "width", "comma-separated list of tree widths")
 	var depths TreeRange
-	fs.Var(&depths, "Depth", "comma-separated list of tree depths")
+	fs.Var(&depths, "depth", "comma-separated list of tree depths")
 	draftModel := fs.String("draft_model", "yuhuili/EAGLE-LLaMA3.1-Instruct-8B", "the model to use for drafting")
 	targetModel := fs.String("target_model", "meta-llama/Llama-3.1-8B-Instruct", "the model to use for verification")
 	if err := fs.Parse(os.Args[1:]); err != nil {
-		log.Fatal(err)
+		slog.Error("could not parse flags", "error", err)
+		os.Exit(1)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -102,7 +109,8 @@ func main() {
 	}
 
 	if err := fullRun(ctx, gpus, widths, depths, os.Environ(), *draftModel, *targetModel); err != nil {
-		log.Fatal(err)
+		slog.Error("could not run bench on all valid tree combinations", "error", err)
+		os.Exit(1)
 	}
 
 	select {
@@ -124,7 +132,7 @@ func fullRun(ctx context.Context, gpus []string, widths, depths []int, environ [
 	var errs []error
 	for err := range errsCh {
 		if err != nil {
-			log.Println(err)
+			slog.Info("startWorkers returned error", "error", err)
 			errs = append(errs, err)
 		}
 	}
@@ -167,7 +175,7 @@ func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []
 			return func() error {
 				gpu := "CUDA_VISIBLE_DEVICES=" + gpu
 				for w := range ch {
-					log.Printf("worker %v: enableCudagraph=%v, width=%v, Depth=%v", port, w.enableCudagraph, w.width, w.depth)
+					slog.Info("startWorker", "port", port, "enableCudagraph", w.enableCudagraph, "width", w.width, "depth", w.depth)
 					b := &BenchServeRunner{
 						EnableCudagraph: w.enableCudagraph,
 						Width:           w.width,
@@ -220,12 +228,16 @@ func (r *BenchServeRunner) Setup(ctx context.Context, configFunc dag.ParentConfi
 	g.Add("bench",
 		dag.WithParents("serve"),
 		dag.WithRunner(&BenchConfig{
-			env: r.Env,
+			parent: "serve",
+			env:    r.Env,
 		}),
 	)
 	g.Add("file printer",
 		dag.WithParents("serve", "bench"),
-		dag.WithRunner(BenchServeOutFileRunner{}),
+		dag.WithRunner(BenchServeOutFileRunner{
+			serveParent: "serve",
+			benchParent: "bench",
+		}),
 	)
 	r.g = g
 	return r
@@ -297,12 +309,16 @@ func (s *ServeConfig) Setup(ctx context.Context, _ dag.ParentConfigFunc) dag.Run
 		cmd: serveCmd,
 		config: func(key string) any {
 			switch key {
+			case "width":
+				return s.width
+			case "depth":
+				return s.depth
 			case "model":
 				return s.targetModel
 			case "port":
 				return s.port
 			case "buffer":
-				return serveBuf
+				return &serveBuf
 			case "cudagraph":
 				return s.enableCudagraph
 			default:
@@ -375,7 +391,7 @@ func (b *BenchConfig) Setup(ctx context.Context, configFunc dag.ParentConfigFunc
 			case "port":
 				return port
 			case "buffer":
-				return benchBuf
+				return &benchBuf
 			default:
 				return nil
 			}
@@ -411,7 +427,7 @@ type BenchServeOutFileRunner struct {
 func (r BenchServeOutFileRunner) Setup(ctx context.Context, configFunc dag.ParentConfigFunc) dag.Runner {
 	return BenchServeOutFileRunner{
 		width:     configFunc(r.serveParent, "width").(int),
-		depth:     configFunc(r.serveParent, "Depth").(int),
+		depth:     configFunc(r.serveParent, "depth").(int),
 		cudagraph: configFunc(r.serveParent, "cudagraph").(bool),
 		serveBuf:  configFunc(r.serveParent, "buffer").(*bytes.Buffer),
 		benchBuf:  configFunc(r.benchParent, "buffer").(*bytes.Buffer),
@@ -435,23 +451,23 @@ func (r BenchServeOutFileRunner) Run(ctx context.Context) error {
 	w := bufio.NewWriter(f)
 	_, err = w.ReadFrom(r.benchBuf)
 	if err != nil {
-		log.Printf("failed to write bench result: %v", err)
+		slog.Info("failed to write bench result", "error", err)
 	}
 	_, err = w.WriteString("\n\n")
 	if err != nil {
-		log.Printf("failed to write newlines: %v", err)
+		slog.Info("failed to write newlines", "error", err)
 	}
 	err = w.Flush()
 	if err != nil {
-		log.Printf("failed to flush bench result: %v", err)
+		slog.Info("failed to flush bench result", "error", err)
 	}
 	_, err = w.ReadFrom(r.serveBuf)
 	if err != nil {
-		log.Printf("failed to write serve result: %v", err)
+		slog.Info("failed to write serve result", "error", err)
 	}
 	err = w.Flush()
 	if err != nil {
-		log.Printf("failed to flush serve result: %v", err)
+		slog.Info("failed to flush serve result", "error", err)
 	}
 	err = f.Close()
 	if err != nil {
