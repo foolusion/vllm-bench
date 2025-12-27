@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -108,7 +109,7 @@ func main() {
 		}
 	}
 
-	if err := fullRun(ctx, gpus, widths, depths, os.Environ(), *draftModel, *targetModel); err != nil {
+	if err := fullRun(ctx, gpus, widths, depths, os.Environ(), *draftModel, *targetModel, logger); err != nil {
 		slog.Error("could not run bench on all valid tree combinations", "error", err)
 		os.Exit(1)
 	}
@@ -126,9 +127,9 @@ type work struct {
 	depth           int
 }
 
-func fullRun(ctx context.Context, gpus []string, widths, depths []int, environ []string, draftModel, targetModel string) error {
+func fullRun(ctx context.Context, gpus []string, widths, depths []int, environ []string, draftModel, targetModel string, logger *slog.Logger) error {
 	ch := generateWork(ctx, widths, depths)
-	errsCh := startWorkers(ctx, ch, gpus, environ, draftModel, targetModel)
+	errsCh := startWorkers(ctx, ch, gpus, environ, draftModel, targetModel, logger)
 	var errs []error
 	for err := range errsCh {
 		if err != nil {
@@ -166,7 +167,7 @@ func generateWork(ctx context.Context, widths, depths []int) <-chan work {
 	return out
 }
 
-func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []string, draftModel, targetModel string) <-chan error {
+func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []string, draftModel, targetModel string, logger *slog.Logger) <-chan error {
 	c := make(chan error, 1)
 	var wg errgroup.Group
 	port := 9000
@@ -175,7 +176,8 @@ func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []
 			return func() error {
 				gpu := "CUDA_VISIBLE_DEVICES=" + gpu
 				for w := range ch {
-					slog.Info("startWorker", "port", port, "enableCudagraph", w.enableCudagraph, "width", w.width, "depth", w.depth)
+					logger.Info("startWorker", "port", port, "enableCudagraph", w.enableCudagraph, "width", w.width, "depth", w.depth)
+					var serveBuf, benchBuf bytes.Buffer
 					b := &BenchServeRunner{
 						EnableCudagraph: w.enableCudagraph,
 						Width:           w.width,
@@ -184,8 +186,22 @@ func startWorkers(ctx context.Context, ch <-chan work, gpus []string, environ []
 						Port:            port,
 						DraftModel:      draftModel,
 						TargetModel:     targetModel,
+						ServeBuf: &serveBuf,
+						BenchBuf: &benchBuf,
 					}
-					if err := b.Setup(ctx, dag.NoParentConfig).Run(ctx); err != nil {
+					g := dag.NewGraph(dag.WithSequential(true))
+					g.Add("worker", dag.WithRunner(b.Setup()))
+					g.Add(
+						"file_writer", 
+						dag.WithParents("worker"),
+						 dag.WithRunner(BenchServeOutFileRunner{
+							width: w.width,
+							depth: w.depth,
+							cudagraph: w.enableCudagraph,
+							serveBuf: &serveBuf,
+							benchBuf: &benchBuf,
+						 }))
+					if err := g.Run(ctx); err != nil {
 						c <- fmt.Errorf("failed to run worker %+v: %w", b, err)
 					}
 				}
@@ -209,46 +225,34 @@ type BenchServeRunner struct {
 	Env                     []string
 	Port                    int
 	DraftModel, TargetModel string
-	g                       *dag.Graph
+	ServeBuf, BenchBuf      io.Writer
+	logger *slog.Logger
 }
 
-func (r *BenchServeRunner) Setup(ctx context.Context, configFunc dag.ParentConfigFunc) dag.Runner {
-	g := dag.NewGraph()
-	g.Add("serve",
-		dag.WithRunner(&ServeConfig{
-			env:             r.Env,
-			targetModel:     r.TargetModel,
-			port:            r.Port,
-			enableCudagraph: r.EnableCudagraph,
-			width:           r.Width,
-			depth:           r.Depth,
-			draftModel:      r.DraftModel,
-		}),
-	)
+func (r *BenchServeRunner) Setup() dag.Runner {
+	g := dag.NewGraph(dag.WithLogger(r.logger))
+	s := &ServeConfig{
+		env:             r.Env,
+		targetModel:     r.TargetModel,
+		port:            r.Port,
+		enableCudagraph: r.EnableCudagraph,
+		width:           r.Width,
+		depth:           r.Depth,
+		draftModel:      r.DraftModel,
+		buf:             r.ServeBuf,
+	}
+	g.Add("serve", dag.WithRunner(s.Setup()))
+	b := &BenchConfig{
+		env:         r.Env,
+		targetModel: r.TargetModel,
+		port:        r.Port,
+		buf:         r.BenchBuf,
+	}
 	g.Add("bench",
 		dag.WithParents("serve"),
-		dag.WithRunner(&BenchConfig{
-			parent: "serve",
-			env:    r.Env,
-		}),
+		dag.WithRunner(b.Setup()),
 	)
-	g.Add("file printer",
-		dag.WithParents("serve", "bench"),
-		dag.WithRunner(BenchServeOutFileRunner{
-			serveParent: "serve",
-			benchParent: "bench",
-		}),
-	)
-	r.g = g
-	return r
-}
-
-func (r *BenchServeRunner) Run(ctx context.Context) error {
-	return r.g.Run(ctx)
-}
-
-func (r *BenchServeRunner) RunConfig(s string) any {
-	return nil
+	return g
 }
 
 type ServeConfig struct {
@@ -259,11 +263,10 @@ type ServeConfig struct {
 	width           int
 	depth           int
 	draftModel      string
-
-	*cmd
+	buf             io.Writer
 }
 
-func (s *ServeConfig) Setup(ctx context.Context, _ dag.ParentConfigFunc) dag.Runner {
+func (s *ServeConfig) Setup() dag.Runner {
 	myEnv := make([]string, len(s.env))
 	copy(myEnv, s.env)
 	myEnv = append(myEnv, "VLLM_USE_V1=1")
@@ -291,43 +294,23 @@ func (s *ServeConfig) Setup(ctx context.Context, _ dag.ParentConfigFunc) dag.Run
 		SpeculativeTokenTree: tree,
 	}
 	serveArgs = append(serveArgs, specConfig.String())
-	serveCtx, serveCancel := context.WithCancel(ctx)
-	serveBuf := bytes.Buffer{}
-	serveCmd := exec.CommandContext(serveCtx, serveArgs[0], serveArgs[1:]...)
-	serveCmd.Env = myEnv
-	serveCmd.Stdout = &serveBuf
-	serveCmd.Stderr = &serveBuf
-	serveCmd.WaitDelay = 10 * time.Second
-	serveCmd.Cancel = func() error {
-		err := serveCmd.Process.Signal(syscall.SIGTERM)
-		if err != nil {
-			return fmt.Errorf("failed to send SIGTERM to serveCmd: %w", err)
-		}
-		return nil
-	}
-	s.cmd = &cmd{
-		cmd: serveCmd,
-		config: func(key string) any {
-			switch key {
-			case "width":
-				return s.width
-			case "depth":
-				return s.depth
-			case "model":
-				return s.targetModel
-			case "port":
-				return s.port
-			case "buffer":
-				return &serveBuf
-			case "cudagraph":
-				return s.enableCudagraph
-			default:
+
+	return &CmdRunner{
+		stdout:    s.buf,
+		stderr:    s.buf,
+		args:      serveArgs,
+		env:       myEnv,
+		waitDelay: 10 * time.Second,
+		cancelFunc: func(c *exec.Cmd) func() error {
+			return func() error {
+				err := c.Process.Signal(syscall.SIGTERM)
+				if err != nil {
+					return fmt.Errorf("failed to send SIGTERM to serveCmd: %w", err)
+				}
 				return nil
 			}
 		},
-		cancel: serveCancel,
 	}
-	return s
 }
 
 func makeTreeString(width int, depth int) string {
@@ -344,98 +327,73 @@ func makeTreeString(width int, depth int) string {
 }
 
 type BenchConfig struct {
-	parent string
-	env    []string
-	*cmd
+	targetModel string
+	port        int
+	env         []string
+	buf         io.Writer
 }
 
-func (b *BenchConfig) Setup(ctx context.Context, configFunc dag.ParentConfigFunc) dag.Runner {
-	targetModel := configFunc(b.parent, "model").(string)
-	port := configFunc(b.parent, "port").(int)
+func (b *BenchConfig) Setup() dag.Runner {
 	benchArgs := []string{
 		"vllm",
 		"bench",
 		"serve",
-		"--model=" + targetModel,
-		"--tokenizer=" + targetModel,
+		"--model=" + b.targetModel,
+		"--tokenizer=" + b.targetModel,
 		"--dataset-name=hf",
 		"--dataset-path=philschmid/mt-bench",
 		"--ignore-eos",
 		"--request-rate=inf",
 		"--max-concurrency=1",
 		"--num-prompts=80",
-		fmt.Sprintf("--port=%d", port),
+		fmt.Sprintf("--port=%d", b.port),
 	}
 
-	benchCtx, benchCancel := context.WithCancel(ctx)
-	defer benchCancel()
-	benchBuf := bytes.Buffer{}
-	benchCmd := exec.CommandContext(benchCtx, benchArgs[0], benchArgs[1:]...)
-	benchCmd.Env = b.env
-	benchCmd.Stdout = &benchBuf
-	benchCmd.Stderr = &benchBuf
-	benchCmd.WaitDelay = 10 * time.Second
-	benchCmd.Cancel = func() error {
-		err := benchCmd.Process.Signal(syscall.SIGTERM)
-		if err != nil {
-			return fmt.Errorf("failed to send SIGTERM to benchCmd: %w", err)
-		}
-		return nil
-	}
-	b.cmd = &cmd{
-		cmd: benchCmd,
-		config: func(key string) any {
-			switch key {
-			case "model":
-				return targetModel
-			case "port":
-				return port
-			case "buffer":
-				return &benchBuf
-			default:
+	return &CmdRunner{
+		stdout:    b.buf,
+		stderr:    b.buf,
+		args:      benchArgs,
+		env:       b.env,
+		waitDelay: 10 * time.Second,
+		cancelFunc: func(c *exec.Cmd) func() error {
+			return func() error {
+				err := c.Process.Signal(syscall.SIGTERM)
+				if err != nil {
+					return fmt.Errorf("failed to send SIGTERM to benchCmd: %w", err)
+				}
 				return nil
 			}
 		},
-		cancel: benchCancel,
 	}
-	return b
 }
 
-type cmd struct {
-	cmd    *exec.Cmd
-	config func(string) any
-	cancel context.CancelFunc
+type CmdRunnerCancelFunc func(*exec.Cmd) func() error
+
+type CmdRunner struct {
+	stdout     io.Writer
+	stderr     io.Writer
+	args       []string
+	env        []string
+	waitDelay  time.Duration
+	cancelFunc CmdRunnerCancelFunc
 }
 
-func (c *cmd) Run(ctx context.Context) error {
-	defer c.cancel()
-	return c.cmd.Run()
-}
-
-func (c *cmd) RunConfig(key string) any {
-	return c.config(key)
+func (c *CmdRunner) Run(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, c.args[0], c.args[1:]...)
+	cmd.Env = c.env
+	cmd.Stdout = c.stdout
+	cmd.Stderr = c.stderr
+	cmd.WaitDelay = c.waitDelay
+	cmd.Cancel = c.cancelFunc(cmd)
+	return cmd.Run()
 }
 
 type BenchServeOutFileRunner struct {
-	serveParent, benchParent string
-	width, depth             int
-	cudagraph                bool
-	benchBuf                 *bytes.Buffer
-	serveBuf                 *bytes.Buffer
-}
-
-func (r BenchServeOutFileRunner) Setup(ctx context.Context, configFunc dag.ParentConfigFunc) dag.Runner {
-	return BenchServeOutFileRunner{
-		width:     configFunc(r.serveParent, "width").(int),
-		depth:     configFunc(r.serveParent, "depth").(int),
-		cudagraph: configFunc(r.serveParent, "cudagraph").(bool),
-		serveBuf:  configFunc(r.serveParent, "buffer").(*bytes.Buffer),
-		benchBuf:  configFunc(r.benchParent, "buffer").(*bytes.Buffer),
-	}
-}
-
-func (r BenchServeOutFileRunner) RunConfig(s string) any {
-	panic("implement me")
+	width     int
+	depth     int
+	cudagraph bool
+	benchBuf  io.ReadWriter
+	serveBuf  io.ReadWriter
 }
 
 func (r BenchServeOutFileRunner) Run(ctx context.Context) error {
