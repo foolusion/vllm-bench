@@ -230,22 +230,32 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 	}
 
 	serveBuf := bytes.Buffer{}
-	serveCmd := exec.Command(serveArgs[0], serveArgs[1:]...)
+	serveCtx, serveCancel := context.WithCancel(ctx)
+	defer serveCancel()
+	serveCmd := exec.CommandContext(serveCtx, serveArgs[0], serveArgs[1:]...)
 	serveCmd.Env = myenv
 	serveCmd.Stdout = &serveBuf
 	serveCmd.Stderr = &serveBuf
 	serveCmd.WaitDelay = 10 * time.Second
+	serveCmd.Cancel = func() error {
+		return serveCmd.Process.Signal(syscall.SIGTERM)
+	}
 	log.Println("starting serve cmd")
 	if err := serveCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start server command: %w", err)
 	}
 
 	benchBuf := bytes.Buffer{}
-	benchCmd := exec.Command(benchArgs[0], benchArgs[1:]...)
+	benchCtx, benchCancel := context.WithCancel(ctx)
+	defer benchCancel()
+	benchCmd := exec.CommandContext(benchCtx, benchArgs[0], benchArgs[1:]...)
 	benchCmd.Env = myenv
 	benchCmd.Stdout = &benchBuf
 	benchCmd.Stderr = &benchBuf
 	benchCmd.WaitDelay = 10 * time.Second
+	benchCmd.Cancel = func() error {
+			return benchCmd.Process.Signal(syscall.SIGTERM)
+	}
 	log.Println("starting bench cmd")
 	if err := benchCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start bench command: %w", err)
@@ -258,6 +268,7 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 			log.Printf("serve failed: %v", err)
 		}
 		log.Println("serve done")
+		benchCancel()
 		close(serveDone)
 	}()
 	benchDone := make(chan error)
@@ -267,6 +278,7 @@ func run(ctx context.Context, enableCudagraph bool, width, depth int, env []stri
 			log.Printf("bench failed: %v", err)
 		}
 		log.Println("bench done")
+		serveCancel()
 		close(benchDone)
 	}()
 
